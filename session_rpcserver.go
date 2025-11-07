@@ -1205,6 +1205,10 @@ func (s *sessionRpcServer) AddAutopilotSession(ctx context.Context,
 		return nil, fmt.Errorf("error creating new session: %v", err)
 	}
 
+	fail := func(err error) error {
+		return err
+	}
+
 	// If this session is being linked to a previous one, then we need to
 	// use the previous session's local private key to sign the new
 	// session's public key in order to prove to the Autopilot server that
@@ -1278,8 +1282,19 @@ func (s *sessionRpcServer) AddAutopilotSession(ctx context.Context,
 		privacyFlags.Serialize(),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error registering session with "+
-			"autopilot server: %v", err)
+		// If we tried to link to a previous session, we delete the
+		// newly created session in the case of errors to avoid having
+		// non-revoked sessions lying around.
+		if len(req.LinkedGroupId) != 0 {
+			deleteErr := s.cfg.db.DeleteReservedSession(
+				ctx, sess.ID,
+			)
+			log.Errorf("error deleting session after failed "+
+				"linking attempt: %v", deleteErr)
+		}
+
+		return nil, fail(fmt.Errorf("error registering session with "+
+			"autopilot server: %v", err))
 	}
 
 	err = s.cfg.db.UpdateSessionRemotePubKey(ctx, sess.ID, remoteKey)
