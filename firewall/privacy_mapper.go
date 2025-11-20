@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/lightninglabs/faraday/frdrpc"
 	"github.com/lightninglabs/lightning-terminal/firewalldb"
 	mid "github.com/lightninglabs/lightning-terminal/rpcmiddleware"
 	"github.com/lightninglabs/lightning-terminal/session"
@@ -535,6 +536,13 @@ func (p *PrivacyMapper) checkers(db firewalldb.PrivacyMapDB,
 	flags session.PrivacyFlags) map[string]mid.RoundTripChecker {
 
 	return map[string]mid.RoundTripChecker{
+		//nolint:ll
+		"/frdrpc.FaradayServer/ForwardingAbility": mid.NewResponseRewriter(
+			&frdrpc.ForwardingAbilityRequest{},
+			&frdrpc.ForwardingAbilityResponse{},
+			handleForwardingAbilityResponse(db, flags),
+			mid.PassThroughErrorHandler,
+		),
 		"/lnrpc.Lightning/GetInfo": mid.NewResponseRewriter(
 			&lnrpc.GetInfoRequest{}, &lnrpc.GetInfoResponse{},
 			handleGetInfoResponse(db, flags),
@@ -585,7 +593,6 @@ func (p *PrivacyMapper) checkers(db firewalldb.PrivacyMapDB,
 			handlePendingChannelsResponse(db, flags, p.randIntn),
 			mid.PassThroughErrorHandler,
 		),
-
 		"/lnrpc.Lightning/BatchOpenChannel": mid.NewFullRewriter(
 			&lnrpc.BatchOpenChannelRequest{},
 			&lnrpc.BatchOpenChannelResponse{},
@@ -600,12 +607,65 @@ func (p *PrivacyMapper) checkers(db firewalldb.PrivacyMapDB,
 			handleChannelOpenResponse(db, flags),
 			mid.PassThroughErrorHandler,
 		),
-
 		"/lnrpc.Lightning/ConnectPeer": mid.NewRequestRewriter(
 			&lnrpc.ConnectPeerRequest{},
 			&lnrpc.ConnectPeerResponse{},
 			handleConnectPeerRequest(db, flags),
 		),
+	}
+}
+
+func handleForwardingAbilityResponse(db firewalldb.PrivacyMapDB,
+	flags session.PrivacyFlags) func(ctx context.Context,
+	r *frdrpc.ForwardingAbilityResponse) (proto.Message, error) {
+
+	return func(ctx context.Context, r *frdrpc.ForwardingAbilityResponse) (
+		proto.Message, error) {
+
+		pairs := make([]*frdrpc.ForwardingAbilityPair, len(r.Pairs))
+
+		err := db.Update(ctx, func(ctx context.Context,
+			tx firewalldb.PrivacyMapTx) error {
+
+			for i, p := range r.Pairs {
+				var err error
+
+				peerIn := p.PeerIn
+				if !flags.Contains(session.ClearPubkeys) {
+					peerIn, err = firewalldb.HideString(
+						ctx, tx, p.PeerIn,
+					)
+					if err != nil {
+						return err
+					}
+				}
+
+				peerOut := p.PeerOut
+				if !flags.Contains(session.ClearPubkeys) {
+					peerOut, err = firewalldb.HideString(
+						ctx, tx, p.PeerOut,
+					)
+					if err != nil {
+						return err
+					}
+				}
+
+				pairs[i] = &frdrpc.ForwardingAbilityPair{
+					PeerIn:  peerIn,
+					PeerOut: peerOut,
+					Ability: p.Ability,
+				}
+			}
+
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		return &frdrpc.ForwardingAbilityResponse{
+			Pairs: pairs,
+		}, nil
 	}
 }
 

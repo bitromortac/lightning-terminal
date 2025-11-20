@@ -152,6 +152,27 @@ func TestPrivacyMapper(t *testing.T) {
 		expectedReplacement proto.Message
 	}{
 		{
+			name:    "ForwardingAbility Response",
+			uri:     "/frdrpc.FaradayServer/ForwardingAbility",
+			msgType: rpcperms.TypeResponse,
+			msg: &frdrpc.ForwardingAbilityResponse{
+				Pairs: []*frdrpc.ForwardingAbilityPair{
+					{
+						PeerIn:  "01020304",
+						PeerOut: "01020304",
+					},
+				},
+			},
+			expectedReplacement: &frdrpc.ForwardingAbilityResponse{
+				Pairs: []*frdrpc.ForwardingAbilityPair{
+					{
+						PeerIn:  "c8134495",
+						PeerOut: "c8134495",
+					},
+				},
+			},
+		},
+		{
 			name:    "GetInfo Response",
 			uri:     "/lnrpc.Lightning/GetInfo",
 			msgType: rpcperms.TypeResponse,
