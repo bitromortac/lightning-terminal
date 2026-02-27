@@ -334,9 +334,9 @@ func TestChannelRestrictResilience(t *testing.T) {
 	}
 
 	// Request: A request that tries to fetch a channel point that is not
-	// known yet. We expect the manager to try to refresh the channel list
-	// again to find the missing channel. The negative cache is empty at
-	// this point. The call fails because chanPoint2 is not known yet.
+	// known yet. With immediate sync, we expect two ListChannels calls:
+	// one during NewEnforcer and one during HandleRequest when it detects
+	// an unknown channel with unmapped deny entries.
 	cfg := &mockLndClient{}
 	cfg.On(
 		"ListChannels", mock.Anything, mock.Anything, mock.Anything,
@@ -349,7 +349,7 @@ func TestChannelRestrictResilience(t *testing.T) {
 				ChannelID:    chanID1,
 				ChannelPoint: chanPointStr1,
 			},
-		}, nil)
+		}, nil).Twice()
 
 	// Each time a request comes in, a new enforcer is created.
 	enf, err := mgr.NewEnforcer(ctx, cfg, &ChannelRestrict{
@@ -369,25 +369,13 @@ func TestChannelRestrictResilience(t *testing.T) {
 	// The request fails because the manager doesn't know about the mapping
 	// of chanPoint2 to chanID2. The negative cache is reset to force a
 	// reload of the mapping on the next request.
-	require.ErrorContains(t, err, "unknown channel point, please retry "+
-		"the request")
+	require.ErrorContains(t, err, "unknown channel point")
 	cfg.AssertExpectations(t)
 
 	// Request: Another request that tries to fetch a known channel point.
-	// We expect another call to ListChannels to refresh the mapping, since
-	// the negative cache was cleared after the last failed request.
+	// No sync expected: chanID2 was already marked as checked, and
+	// chanPoint1 is known from previous sync.
 	cfg = &mockLndClient{}
-	cfg.On(
-		"ListChannels", mock.Anything, mock.Anything, mock.Anything,
-		mock.Anything,
-	).Return(
-		[]lndclient.ChannelInfo{
-			{
-				ChannelID:    chanID1,
-				ChannelPoint: chanPointStr1,
-			},
-		}, nil)
-
 	enf, err = mgr.NewEnforcer(ctx, cfg, &ChannelRestrict{
 		DenyList: []uint64{chanID2},
 	})
@@ -405,9 +393,20 @@ func TestChannelRestrictResilience(t *testing.T) {
 	cfg.AssertExpectations(t)
 
 	// Request: In case we retry the request for the unknown channel, we
-	// should error again. This time we don't expect another call to
-	// ListChannels because the negative cache was not invalidated before.
+	// should error again. HandleRequest will detect unmapped chanID2 and
+	// trigger immediate sync.
 	cfg = &mockLndClient{}
+	cfg.On(
+		"ListChannels", mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything,
+	).Return(
+		[]lndclient.ChannelInfo{
+			{
+				ChannelID:    chanID1,
+				ChannelPoint: chanPointStr1,
+			},
+		}, nil).Once()
+
 	enf, err = mgr.NewEnforcer(ctx, cfg, &ChannelRestrict{
 		DenyList: []uint64{chanID2},
 	})
@@ -422,9 +421,8 @@ func TestChannelRestrictResilience(t *testing.T) {
 		},
 	)
 
-	// The call errors, which invalidates the negative cache again.
-	require.ErrorContains(t, err, "unknown channel point, please retry "+
-		"the request")
+	// The call errors because chanPoint2 is still not in the channel list.
+	require.ErrorContains(t, err, "unknown channel point")
 	cfg.AssertExpectations(t)
 
 	// We simulate the channel getting confirmed.
