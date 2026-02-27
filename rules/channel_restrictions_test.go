@@ -484,3 +484,144 @@ func TestChannelRestrictResilience(t *testing.T) {
 	require.NoError(t, err)
 	cfg.AssertExpectations(t)
 }
+
+// TestChannelRestrictThreePhaseWithRetry tests the manager's resilience when a
+// restricted channel closes and a new channel opens, ensuring proper retry
+// behavior on unknown channel points.
+func TestChannelRestrictThreePhaseWithRetry(t *testing.T) {
+	var (
+		ctx = context.Background()
+		mgr = NewChannelRestrictMgr()
+	)
+
+	// Set up three channels: chanOld (closed, in deny list), chanNew
+	// (opening), and chanOther (baseline open channel).
+	_, _, err := newTXID()
+	require.NoError(t, err)
+	chanOld, _ := firewalldb.NewPseudoUint64()
+
+	txidOther, indexOther, err := newTXID()
+	require.NoError(t, err)
+	chanPointStrOther := fmt.Sprintf("%s:%d", hex.EncodeToString(txidOther),
+		indexOther)
+	chanOther, _ := firewalldb.NewPseudoUint64()
+	chanPointOther := &lnrpc.ChannelPoint{
+		FundingTxid: &lnrpc.ChannelPoint_FundingTxidStr{
+			FundingTxidStr: hex.EncodeToString(txidOther),
+		},
+		OutputIndex: indexOther,
+	}
+
+	txidNew, indexNew, err := newTXID()
+	require.NoError(t, err)
+	chanPointStrNew := fmt.Sprintf("%s:%d", hex.EncodeToString(txidNew),
+		indexNew)
+	chanNew, _ := firewalldb.NewPseudoUint64()
+	chanPointNew := &lnrpc.ChannelPoint{
+		FundingTxid: &lnrpc.ChannelPoint_FundingTxidStr{
+			FundingTxidStr: hex.EncodeToString(txidNew),
+		},
+		OutputIndex: indexNew,
+	}
+
+	// Phase 1: chanOld is closed and restricted. Actions on non-restricted
+	// channels should succeed.
+	cfg := &mockLndClient{}
+	cfg.On(
+		"ListChannels", mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything,
+	).Return(
+		[]lndclient.ChannelInfo{
+			{
+				ChannelID:    chanOther,
+				ChannelPoint: chanPointStrOther,
+			},
+		}, nil).Once()
+
+	enf, err := mgr.NewEnforcer(
+		ctx, cfg, &ChannelRestrict{
+			DenyList: []uint64{chanOld},
+		},
+	)
+	require.NoError(t, err)
+
+	_, err = enf.HandleRequest(
+		ctx, "/lnrpc.Lightning/UpdateChannelPolicy",
+		&lnrpc.PolicyUpdateRequest{
+			Scope: &lnrpc.PolicyUpdateRequest_ChanPoint{
+				ChanPoint: chanPointOther,
+			},
+		},
+	)
+	require.NoError(t, err)
+	cfg.AssertExpectations(t)
+
+	// Phase 2: Attempt action on chanNew (not yet mapped). Should fail with
+	// unknown channel error since chanNew is not in the channel list and
+	// chanOld is in deny list but not mapped.
+	cfg = &mockLndClient{}
+	cfg.On(
+		"ListChannels", mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything,
+	).Return(
+		[]lndclient.ChannelInfo{
+			{
+				ChannelID:    chanOther,
+				ChannelPoint: chanPointStrOther,
+			},
+		}, nil).Once()
+
+	enf, err = mgr.NewEnforcer(
+		ctx, cfg, &ChannelRestrict{
+			DenyList: []uint64{chanOld},
+		},
+	)
+	require.NoError(t, err)
+
+	_, err = enf.HandleRequest(
+		ctx, "/lnrpc.Lightning/UpdateChannelPolicy",
+		&lnrpc.PolicyUpdateRequest{
+			Scope: &lnrpc.PolicyUpdateRequest_ChanPoint{
+				ChanPoint: chanPointNew,
+			},
+		},
+	)
+	require.ErrorContains(t, err, "unknown channel point")
+	cfg.AssertExpectations(t)
+
+	// Phase 3: After resync with chanNew confirmed, the action should
+	// succeed.
+	cfg = &mockLndClient{}
+	cfg.On(
+		"ListChannels", mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything,
+	).Return(
+		[]lndclient.ChannelInfo{
+			{
+				ChannelID:    chanOther,
+				ChannelPoint: chanPointStrOther,
+			},
+			{
+				ChannelID:    chanNew,
+				ChannelPoint: chanPointStrNew,
+			},
+		}, nil).Once()
+
+	enf, err = mgr.NewEnforcer(
+		ctx, cfg, &ChannelRestrict{
+			DenyList: []uint64{chanOld},
+		},
+	)
+	require.NoError(t, err)
+
+	_, err = enf.HandleRequest(
+		ctx, "/lnrpc.Lightning/UpdateChannelPolicy",
+		&lnrpc.PolicyUpdateRequest{
+			Scope: &lnrpc.PolicyUpdateRequest_ChanPoint{
+				ChanPoint: chanPointNew,
+			},
+		},
+	)
+	require.NoError(t, err)
+	cfg.AssertExpectations(t)
+}
