@@ -1012,6 +1012,18 @@ func loadConfigFile(preCfg *Config, interceptor signal.Interceptor) (*Config,
 			cfg.Lnd.ProtocolOptions.CustomMessage, lnwire.MsgError,
 		)
 
+		// tapd's RFQ subsystem enforces the agreed upon quote for asset
+		// HTLCs through lnd's HTLC interceptor. Whenever no interceptor
+		// is attached, lnd forwards HTLCs without any of those checks,
+		// which would allow asset HTLCs to be forwarded while tapd is
+		// starting up or while it is re-establishing its interception
+		// stream. We therefore require an interceptor to be present
+		// whenever tapd runs in-process, which makes lnd fail HTLCs
+		// back instead of forwarding them unchecked.
+		if cfg.TaprootAssetsMode == ModeIntegrated {
+			cfg.Lnd.RequireInterceptor = true
+		}
+
 		var err error
 		cfg.Lnd, err = lnd.ValidateConfig(
 			*cfg.Lnd, interceptor, fileParser, flagParser,
