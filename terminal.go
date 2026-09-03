@@ -206,6 +206,11 @@ type LightningTerminal struct {
 	lndConn   *grpc.ClientConn
 	lndClient *lndclient.GrpcLndServices
 
+	// auxReady, when set, is closed once tapd (the aux implementation) is
+	// started. lnd's sweeper waits on it before consuming the aux
+	// components, so it never reaches into tapd before tapd is up.
+	auxReady chan struct{}
+
 	// basicClient may be accessed by other sub-systems but this access
 	// should be provided via the basicLNDClient method.
 	basicClient    lnrpc.LightningClient
@@ -848,7 +853,32 @@ func (g *LightningTerminal) start(ctx context.Context) error {
 	// Both connection types are ready now, let's start our sub-servers if
 	// they should be started locally as an integrated service.
 	createDefaultMacaroons := !g.cfg.statelessInitMode
-	g.subServerMgr.StartIntegratedServers(
+
+	// tapd must be started first: it provides lnd's aux components, and
+	// lnd's sweeper waits for the aux readiness signal before attempting a
+	// sweep. Closing that signal here lets the sweeper proceed, so we can
+	// then wait for lnd to be chain-synced before starting the remaining
+	// sub-servers.
+	g.subServerMgr.StartTapd(
+		g.basicClient, g.lndClient, createDefaultMacaroons,
+	)
+	if g.auxReady != nil {
+		close(g.auxReady)
+	}
+
+	// Only when tapd is integrated do we skip the chain-sync wait inside
+	// setupFullLNDClient; in that case we wait for it here, after tapd is
+	// up, so the remaining sub-servers still start against a synced lnd.
+	if g.cfg.LndMode == ModeIntegrated &&
+		g.cfg.TaprootAssetsMode == ModeIntegrated {
+
+		if err := g.waitForChainSync(ctx); err != nil {
+			return fmt.Errorf("error waiting for chain sync: %w",
+				err)
+		}
+	}
+
+	g.subServerMgr.StartRemainingIntegratedServers(
 		g.basicClient, g.lndClient, createDefaultMacaroons,
 	)
 
@@ -1020,6 +1050,20 @@ func (g *LightningTerminal) setupFullLNDClient(ctx context.Context,
 	// so if we instruct the lndclient to wait for the wallet sync, we
 	// should be fully ready to start all our subservers. This will just
 	// block until lnd signals readiness.
+	//
+	// There is one exception: with both lnd and tapd running in-process, we
+	// must not wait for lnd to be synced to chain here. lnd only reports
+	// itself as synced once its blockbeat caught up, and block processing
+	// can be blocked on tapd's aux components (e.g. the aux sweeper), which
+	// only become available once tapd is started. As tapd is only started
+	// after we have the client below, waiting here would stall startup.
+	// Instead, tapd is started first, and the chain-sync wait is performed
+	// explicitly after tapd is up, so the remaining sub-servers still start
+	// against a synced lnd.
+	integratedTapd := g.cfg.LndMode == ModeIntegrated &&
+		g.cfg.TaprootAssetsMode == ModeIntegrated
+	blockUntilChainSynced := !integratedTapd
+
 	log.Infof("Connecting full lnd client")
 	for {
 		g.lndClient, err = lndclient.NewLndServices(
@@ -1037,7 +1081,7 @@ func (g *LightningTerminal) setupFullLNDClient(ctx context.Context,
 				RPCTimeout:            g.cfg.LndRPCTimeout,
 				ChainSyncPollInterval: g.cfg.LndConnectInterval,
 
-				BlockUntilChainSynced:   true,
+				BlockUntilChainSynced:   blockUntilChainSynced,
 				BlockUntilUnlocked:      true,
 				BlockUntilChainNotifier: true,
 			},
@@ -1087,6 +1131,39 @@ func (g *LightningTerminal) setupFullLNDClient(ctx context.Context,
 	}
 
 	return nil
+}
+
+// waitForChainSync blocks until lnd reports itself as fully synced to its
+// chain backend. It mirrors lndclient's own chain-sync wait, but is called
+// explicitly after tapd is started, so that lnd's sweeper (which can be
+// blocked on tapd's aux components) has already been released.
+func (g *LightningTerminal) waitForChainSync(ctx context.Context) error {
+	log.Infof("Waiting for lnd to be fully synced to its chain backend")
+
+	pollInterval := g.cfg.LndConnectInterval
+	for {
+		ctxt, cancel := context.WithTimeout(ctx, g.cfg.LndRPCTimeout)
+		info, err := g.basicClient.GetInfo(
+			ctxt, &lnrpc.GetInfoRequest{},
+		)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("error in GetInfo call: %w", err)
+		}
+
+		if info.SyncedToChain {
+			log.Infof("lnd is now fully synced to its chain " +
+				"backend")
+
+			return nil
+		}
+
+		select {
+		case <-time.After(pollInterval):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // startInternalSubServers starts all Litd specific sub-servers.
@@ -1560,6 +1637,11 @@ func (g *LightningTerminal) buildAuxComponents(
 			err)
 	}
 
+	// Create the aux readiness channel. lnd's sweeper waits on it before
+	// attempting a sweep, so it never reaches into tapd before tapd is
+	// started. litd closes it once tapd is running.
+	g.auxReady = make(chan struct{})
+
 	return &lnd.AuxComponents{
 		AuxLeafStore: fn.Some[lnwallet.AuxLeafStore](tapd),
 		MsgRouter:    fn.Some[msgmux.Router](router),
@@ -1577,6 +1659,7 @@ func (g *LightningTerminal) buildAuxComponents(
 		AuxChannelNegotiator: fn.Some[lnwallet.AuxChannelNegotiator](
 			tapd,
 		),
+		Ready: fn.Some[<-chan struct{}](g.auxReady),
 	}, nil
 }
 

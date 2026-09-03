@@ -103,34 +103,63 @@ func (s *Manager) GetServer(name string) (SubServer, bool) {
 	return ss.SubServer, true
 }
 
-// StartIntegratedServers starts all the manager's sub-servers that should be
-// started in integrated mode.
-func (s *Manager) StartIntegratedServers(lndClient lnrpc.LightningClient,
+// StartTapd starts the tapd sub-server in integrated mode. tapd must be
+// started before lnd's sweeper consumes its aux components; lnd's sweeper
+// waits for the aux readiness signal that litd closes once tapd is up.
+func (s *Manager) StartTapd(lndClient lnrpc.LightningClient,
 	lndGrpc *lndclient.GrpcLndServices, withMacaroonService bool) {
+
+	s.startIntegratedServer(
+		s.servers[TAP], lndClient, lndGrpc, withMacaroonService,
+	)
+}
+
+// StartRemainingIntegratedServers starts all the manager's integrated
+// sub-servers except tapd. It is called only after lnd has been waited to be
+// chain-synced, so these sub-servers still start against a synced lnd.
+func (s *Manager) StartRemainingIntegratedServers(
+	lndClient lnrpc.LightningClient, lndGrpc *lndclient.GrpcLndServices,
+	withMacaroonService bool) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, ss := range s.servers {
-		if ss.Remote() {
+	for name, ss := range s.servers {
+		if name == TAP {
 			continue
 		}
 
-		err := ss.startIntegrated(
-			lndClient, lndGrpc, withMacaroonService,
-			func(err error) {
-				s.statusServer.SetErrored(
-					ss.Name(), err.Error(),
-				)
-			},
+		s.startIntegratedServer(
+			ss, lndClient, lndGrpc, withMacaroonService,
 		)
-		if err != nil {
-			s.statusServer.SetErrored(ss.Name(), err.Error())
-			continue
-		}
-
-		s.statusServer.SetRunning(ss.Name())
 	}
+}
+
+// startIntegratedServer starts a single integrated sub-server, skipping
+// remote ones.
+//
+// NOTE: The caller must hold the manager's mutex.
+func (s *Manager) startIntegratedServer(ss *subServerWrapper,
+	lndClient lnrpc.LightningClient, lndGrpc *lndclient.GrpcLndServices,
+	withMacaroonService bool) {
+
+	if ss == nil || ss.Remote() {
+		return
+	}
+
+	err := ss.startIntegrated(
+		lndClient, lndGrpc, withMacaroonService,
+		func(err error) {
+			s.statusServer.SetErrored(ss.Name(), err.Error())
+		},
+	)
+	if err != nil {
+		s.statusServer.SetErrored(ss.Name(), err.Error())
+
+		return
+	}
+
+	s.statusServer.SetRunning(ss.Name())
 }
 
 // ConnectRemoteSubServers creates connections to all the manager's sub-servers

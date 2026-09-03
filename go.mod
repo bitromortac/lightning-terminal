@@ -247,6 +247,9 @@ replace (
 	github.com/lightninglabs/lightning-terminal/perms => ./perms
 )
 
+// Local prototype: lnd with the aux-readiness gate for the tapd startup stall.
+replace github.com/lightningnetwork/lnd => github.com/bitromortac/lnd v0.16.0-beta.rc3.0.20260903124848-3b5752dccbf1
+
 // We want to format raw bytes as hex instead of base64. The forked version
 // allows us to specify that as an option. This is required for the
 // taproot-assets dependency to function properly.
